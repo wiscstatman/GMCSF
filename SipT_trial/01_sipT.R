@@ -38,8 +38,6 @@ count.func <- function(pval.vec, thresh.vec){
 
 # load t-test & Wilcoxon rank-sum test results
 load("sipT_results.RData")
-load("sipT_muB.RData")
-load("sipT_all.RData")
 
 ####################################################################################### 
 #                                      Setup Dataset                                  #
