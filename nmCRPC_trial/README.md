@@ -1,0 +1,5 @@
+Email excerpt from Doug dated 05/23/2021:
+
+To help bolster that conclusion, I wonder if you wouldn’t mind looking at the two other trial sets for which we already have data.  You will be happy to know these are the last sets we have!  One is a trial of PAP vaccine + GM-CSF in patients with later stage disease.  These samples are labeled with PDV, and we have samples from pre-treatment and 6 months only.  Again, the goal is to sort of “validate” what you saw with the JITC paper, looking to see if there are significant changes pre to post, and whether these overlap with what was previously identified.
+
+ I am attaching the code breaker ("VPD and PDV trials.xlsx") for these trials, and you should already have the processed aggregate data file as these samples were evaluated at the same time that we did the ARV trial. 

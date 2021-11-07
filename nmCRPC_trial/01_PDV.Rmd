@@ -1,0 +1,186 @@
+---
+title: "PDV Trial"
+author: "Tun Lee Ng and Michael A. Newton"
+date: "June 2021"
+output: 
+  pdf_document:
+    toc: true
+    number_sections: true
+    citation_package: natbib
+link-citations: true
+linkcolor: blue
+header-includes:
+   \usepackage{enumerate}
+   \usepackage{amsmath}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+```
+
+# Introduction 
+
+This is a trial of PAP vaccine + GM-CSF in all 12 patients with later stage disease. The samples are labeled with PDV, and we have samples from pre-treatment and 6 months only.  The objective is to sort-of “validate” what we reported in the JITC paper \citep{Potluri2020JITC}, looking to see if there are significant changes pre to post, and whether these overlap with what was previously identified.  
+
+We applied a log2 transformation of the peptide fluorescence data, and we verified that the peptide array data were normalized accordingly via the boxplots of log2 fluorescence level of all peptides.
+
+```{r}
+library(tidyverse)
+library(RColorBrewer)
+library(kableExtra)
+
+####################################################################################### 
+#                           Some Common Variables and Functions                       #
+####################################################################################### 
+
+# function to count peptides at different FDR thresholds
+count.func <- function(pval.vec, thresh.vec){
+  counter <- NULL
+  for (i in thresh.vec ){
+    counter <- c(counter, length(pval.vec[pval.vec <= i]))
+  }
+  countab <- rbind(c("FDR threshold", thresh.vec),
+                   c("Peptide counts", counter))
+  return(countab)
+}
+```
+
+```{r, cache=T, fig.height = 5}
+####################################################################################### 
+#                                      Setup Dataset                                  #
+####################################################################################### 
+
+dat <- read_tsv("Processed_aggregate_data.txt")
+colnames(dat)[18:197] <- paste0( substr(colnames(dat)[18:197],1,7), substr(colnames(dat)[18:197],16,18) )
+sample_dat <- read_csv("PDV_sample.csv")
+
+# arrange samples according time and patients
+sample_dat <- sample_dat %>%
+  arrange(desc(Time), Patient_ID)
+
+# subset columns of dat
+dat2 <- subset(dat, select = c("SEQ_ID", "PROBE_ID", sample_dat$Array_ID))
+
+# take log2 then take post - pre
+dat3 = as.matrix(log2( dat2[,3:ncol(dat2)] ))
+dat3 = dat3[,(ncol(dat3)/2 + 1):ncol(dat3)] - dat3[,1:(ncol(dat3)/2)] 
+colnames(dat3) <- sample_dat$Patient_ID[1:ncol(dat3)]
+
+# save probe ID and protein ID as well
+dat3_probeID <- dat2$PROBE_ID
+dat3_seqID <- dat2$SEQ_ID
+
+####################################################################################### 
+#                           Check Fluorescence Normalization                          #
+####################################################################################### 
+
+long_dat <- log2(dat2[,3:ncol(dat2)]) 
+colnames(long_dat) <- paste( sample_dat$Patient_ID, sample_dat$Time, sep = "_" )
+long_dat <- long_dat %>% 
+  pivot_longer(cols = everything(), names_to = "patient_time", values_to = "log2_fluorescence") 
+
+# set fill color
+long_dat$time <- factor(rep(sample_dat$Time, nrow(dat2)))
+
+# sort order of patients in boxplot
+long_dat$patient_time <- factor(long_dat$patient_time, 
+                                levels = paste( sample_dat$Patient_ID, sample_dat$Time, sep = "_" ))
+
+# set boxplot color
+boxplot_pal <- brewer.pal(9,"Set1")[c(7,5)]
+names(boxplot_pal) <- levels(long_dat$time )
+
+ggplot(long_dat, aes(x = patient_time, y = log2_fluorescence, fill = time)) +
+  geom_boxplot(outlier.shape = ".") +
+  scale_fill_manual(name = "time", values = boxplot_pal[levels(long_dat$time)]) +
+  labs(title = "Boxplots of Peptide Fluorescence Levels for Patients (pre- and post- treatment) ", 
+       x = "Patient_Time", y = "Log2 Fluorescence Levels") +
+  theme(panel.background = element_rect(fill = "grey90"),
+        panel.grid.major = element_line(color = "white"),
+        panel.grid.minor = element_line(color = "white"),
+        axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+        legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5))
+```
+
+# Statistical Test
+
+We deploy peptide-level t-tests and Wilcoxon tests on the difference (post - pre) between log2(fluorescence) to identify changes in peptide-level antibody response among all 12 patients.
+
+We plot the p-value histograms.
+
+```{r, cache = T}
+# initialize
+pval <- rep(NA, nrow(dat3))
+est <- rep(NA, nrow(dat3))
+StdErr <- rep(NA, nrow(dat3))
+Wilcox_pval <- rep(NA, nrow(dat3))
+
+for(i in 1:nrow(dat3)){
+  fit1 <- t.test(as.numeric(dat3[i, ]),alternative = "two.sided")
+  pval[i] <- fit1$p.value
+  est[i] <- fit1$estimate
+  StdErr[i] <- fit1$stderr
+  Wilcox_pval[i] <- wilcox.test(as.numeric(dat3[i, ]), alternative = "two.sided",mu=0)$p.value
+}
+
+BHpval_ttest <- p.adjust(pval, method = "BH") # t-test BH-adj p-val
+BHpval_wilcox <- p.adjust(Wilcox_pval, method = "BH") # wilcoxon BH-adj p-val
+```
+
+```{r, fig.height=5}
+par(mfrow=c(1,2))
+hist(pval, xlab = "t-test p-val", freq = F, col = "grey", breaks= 50, 
+     main = "t-test p-value histogram")
+hist(Wilcox_pval, xlab = "Wilcox p-val", freq = F, col = "grey", 
+     main = "Wilcoxon-test p-value histogram")
+```
+
+Applying the Benjamini-Hochberg (BH) method \citep{BHfdr} on the t-test p-values to control FDR, we tabulate peptide counts at various FDR thresholds:
+
+```{r}
+kable( count.func(BHpval_ttest, seq(.15, .25,by=.01)),
+       format = "latex", row.names= NA, col.names = NA, booktabs = T )%>%
+  kable_styling(latex_options = c("hold_position")) %>%
+  row_spec(1, hline_after = T)
+```
+
+We also tabulate the peptide counts at various FDR thresholds based on BH-adjusted Wilcoxon p-values. 
+
+```{r}
+kable( count.func(BHpval_wilcox, seq(.15, .25,by=.01)),
+       format = "latex", row.names= NA, col.names = NA, booktabs = T )%>%
+  kable_styling(latex_options = c("hold_position")) %>%
+  row_spec(1, hline_after = T)
+```
+
+The histograms of p-values suggest that there might be some signal of antibody response changes among the 12 patients, but none of the 177,604 peptides are significant at 10\% FDR. This could be due to the small sample size (12 patients) of the PDV trial. 
+
+# Comparison with JITC paper
+
+In the JITC paper \citep{Potluri2020JITC}, we have identified 5680 significant peptides. We shall superimpose these 5680 peptides (represented by red dots) on top of the volcano plot ( -log10(p-value) vs effect estimate) for this PDV trial. The effect estimate in this case is simply the difference (post - pre) between log2(fluorescence).   
+
+```{r,fig.height=6}
+####################################################################################### 
+#                          Compare against JITC List                                  #
+####################################################################################### 
+
+# JITC list
+JITC_list <- read_csv("JITC_PAP_Longitudinal.csv")
+JITC_ind <- which(dat3_probeID %in% JITC_list$PROBE_ID)
+
+plot(x = est, y = -log10(pval), pch = ".",
+     xlab = "fold changes", ylab = "-log10(t-test p-values)", main = "volcano plot" )
+lines(x = est[JITC_ind], y = (-log10(pval))[JITC_ind], 
+      type = "p", pch = 20, cex = .3, col = "red")
+abline(v = 1, col = "blue", lty = 2)
+abline(h = -log10(.05), col = "blue", lty = 2)
+
+prct_smallpval_bigfold <- round(sum(as.numeric( (est[JITC_ind] >= 1)&(pval[JITC_ind] <= .05) ))/nrow(JITC_list)*100,2) 
+prct_bigfold <- round(sum(as.numeric( est[JITC_ind] >= 1 ))/nrow(JITC_list)*100,2)  
+```
+
+The horizontal blue dashed line represents $-\log_{10}(0.05)$ whereas the vertical blue dashed line represents unit fold-change. From the preceding volcano plot, we observe that most (`r prct_smallpval_bigfold` \%) of all the JITC-identified peptides fall on the top right quadrant of the volcano plot (small raw p-values $<=$ 0.05 with at least one-fold increase in peptide activity in this PDV trial). In fact, `r prct_bigfold` \% of all the JITC-identified peptides display at least one-fold increase in peptide activity in this PDV trial (represented by the red dots on the right side of the vertical dashed line). This corroborates with our reported results in the JITC paper.    
+
+
+\bibliography{PDV_trial} 
