@@ -1,0 +1,364 @@
+---
+title: | 
+  | AR Trial: Comparing 
+  | Vaccine + GM-CSF vs Vaccine only
+author: "Tun Lee Ng and Michael A. Newton"
+date: "November 13, 2020"
+output: 
+  pdf_document:
+    toc: true
+    number_sections: true
+    citation_package: natbib
+link-citations: true
+linkcolor: blue
+header-includes:
+   \usepackage{enumerate}
+   \usepackage{amsmath}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+```
+
+# Introduction 
+
+Previously, we found no significant difference in fold changes of peptide fluorescence between 2 groups of patients -- one group administered with vaccine + GM-CSF, another with GM-CSF only -- in a blinded randomized trial.  
+
+Now, we have peptide data (177604 peptides, no peptide duplicates) from a small study (sample size = 16) in which patients were treated with a different vaccine (different from the PAP vaccine in the PAP/ADT analysis in \citet{Potluri2020JITC}), and with or without GM-CSF (8 patients in each of the 2 groups). In fact, for each of these 2 treatment groups, 4 patients were subject to vaccination schedule I (VX-1):  6 vaccines, two weeks part, for 12 weeks, and then once every 3 months; whereas the other 4 patients were subject to another schedule (VX-2): the same dose of vaccine, but at weeks 0, 2, 12, and 14.  
+
+Peptide array data were obtained at 3 different time points: pre, 3 months and 6 months post treatment. We want to investigate the changes in peptide level across time for these 2 groups of patients (vaccine + GM-CSF versus vaccine only).  
+
+We applied a log2 transformation of the peptide fluorescence data, and we verified that the peptide array data were normalized accordingly via the boxplots of log2 fluorescence level of all peptides for each patient across the 3 time points.   
+
+```{r}
+library(lmerTest)
+library(lme4)
+library(locfdr)
+library(tidyverse)
+library(RColorBrewer)
+library(fdrtool)
+library(kableExtra)
+library(gridExtra)
+
+####################################################################################### 
+#                           Some Common Variables and Functions                       #
+####################################################################################### 
+
+# function to plot PCA loadings
+PCload.func <- function(cols, shapes, U, D, x, y, pca.vec, title){
+  Z <- U %*% diag(D)
+  plot(Z[,x], Z[,y], col = cols, pch = shapes, main = title, las = 1,
+       xlab = paste0("PC",x," (", round(pca.vec[x]*100, 1) ,"% variance explained)"),
+       ylab = paste0("PC",y," (", round(pca.vec[y]*100, 1) ,"% variance explained)") 
+  )
+}
+
+
+# function to count peptides at different FDR thresholds
+count.func <- function(pval.vec, thresh.vec){
+  counter <- NULL
+  for (i in thresh.vec ){
+    counter <- c(counter, length(pval.vec[pval.vec <= i]))
+  }
+  countab <- rbind(c("FDR threshold", thresh.vec),
+                   c("Peptide counts", counter))
+  return(countab)
+}
+
+load("01_ARtrial_results.RData")
+```
+
+```{r, cache=T}
+####################################################################################### 
+#                                      Setup Dataset                                  #
+####################################################################################### 
+# read peptide array data
+dat <- read_tsv("Aggregate_processed_data/Processed_aggregate_data.txt")
+colnames(dat)[18:197] <- paste0( substr(colnames(dat)[18:197],1,7),
+                                 substr(colnames(dat)[18:197],16,18) )
+
+# log2 transformation
+dat_log2 <- dat
+dat_log2[,18:197] <- log2(dat[,18:197])
+
+# read samples/patients data
+sample_dat <- read_csv("PA_00166_Experiment_Layout.csv")
+
+# arrange by time, then treatment type, then patient_ID
+sample_dat <- sample_dat %>% 
+  arrange(factor(Time, levels = c("Pre", "3_month", "6_month")), 
+          factor(Treatment, levels = c("VX1_no", "VX1_GM", "VX2_no", "VX2_GM")), 
+          Patient_ID)
+
+# remove not-relevant columns in dat_log2?
+dat_log2 <- cbind( dat_log2 %>% select(PROBE_DESIGN_ID:Y),
+                   subset(dat_log2[, 18:197], 
+                          select = colnames(dat_log2)[18:197] %in% sample_dat$Array_ID ))
+
+# arrange columns of dat_log2 
+iii <- match( sample_dat$Array_ID, colnames(dat_log2[,18:ncol(dat_log2)]) )
+dat_log2 <- dat_log2[, c(1:17, iii+17)]
+
+# patient_time tag
+sample_dat <- sample_dat %>%
+  mutate(Time2 = as_factor(Time),
+         Time2 = fct_recode(Time2,
+           "Pre" = "Pre",
+            "3mo" = "3_month",
+            "6mo" = "6_month" 
+         ))
+sample_dat$Patient_Time <- paste(sample_dat$Patient_ID, sample_dat$Time2, sep = "_")
+colnames(dat_log2)[18: ncol(dat_log2)] <- sample_dat$Patient_Time 
+
+# separate treatment type and schedule
+sample_dat$Treat <- factor(sub(".*_","",sample_dat$Treatment), levels = c("no", "GM"))
+sample_dat$Schedule <- factor(substr(sample_dat$Treatment, 1, 3), levels = c("VX1", "VX2") )
+
+# set time as numeric variable
+time_vec <- c(0,3,6)
+names(time_vec) <- levels(sample_dat$Time2)
+sample_dat$Time3 <- unname(time_vec[sample_dat$Time2])
+
+# set color
+sample_dat <- sample_dat %>%
+  mutate(Treatment = factor(Treatment, 
+                            levels = c("VX1_no", "VX1_GM", "VX2_no", "VX2_GM")),
+         Time = factor(Time, levels = c("Pre", "3_month", "6_month")))
+
+pal <- brewer.pal(9,"Set1")[c(6,5,4,7)]
+names(pal) <- levels(sample_dat$Treatment)
+
+# get data frame ready for boxplot to check fluorescence normalization
+dat_log2_long <- dat_log2[, 18:ncol(dat_log2)] %>% 
+  pivot_longer(cols = everything(), names_to = "id_time", values_to = "fluorescence") 
+
+# set fill color
+dat_log2_long$treat <- rep(sample_dat$Treatment, 177604)
+
+# sort order of patients in boxplot
+dat_log2_long$id_time <- factor(dat_log2_long$id_time, 
+                                levels = sample_dat$Patient_Time)
+```
+
+```{r, cache=T, fig.height = 5}
+ggplot(dat_log2_long, aes(x = id_time, y = fluorescence, fill = treat)) +
+  geom_boxplot(outlier.shape = ".") +
+  scale_fill_manual(name = "treatment", values = pal[levels(dat_log2_long$treat)]) +
+  labs(x = "Patient_Time", y = "Log2 Fluorescence Levels", 
+       title = "Boxplots of Peptide Fluorescence Levels for Patients at 3 time points") +
+  theme(panel.background = element_rect(fill = "grey90"),
+        panel.grid.major = element_line(color = "white"),
+        panel.grid.minor = element_line(color = "white"),
+        axis.text.x = element_text(angle = 90, hjust = 1, size = 5),
+        legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5))
+```
+
+# Statistical Test
+
+To detect changes in peptide level across time, we applied the same technique as we did in \citet{Potluri2020JITC}. Specifically, we first split the patients into 2 groups: 1 group corresponds to the treatment arm containing GM-CSF, the other without GM-CSF. For each group, we deployed the linear mixed model on each of the 177604 peptides:
+
+$$
+y_{i\tau} = \beta_0 + \beta_1 \tau + b_{0i} + b_{1i} \tau + \epsilon_{i},  
+$$
+where  
+
+* $y_{i \tau}$ be the log2 fluorescence level for the $i^{th}$ patient at time $\tau$
+* $i = 1, \cdots, 8$ and $\tau$ = 0, 3 or 6 months
+* $\beta_0$ = the baseline antibody response level for all patients in the treatment group
+* $b_{0i}$ is the random intercept of the $i^{th}$ patient
+* $b_{1j}$ is the random slope of the $i^{th}$ patient
+* $\left( \begin{smallmatrix} b_{0i} \\ b_{1i} \\ \epsilon_i \end{smallmatrix} \right)$ $\sim N_3$ $\left( \left[ \begin{smallmatrix} 0 \\ 0 \\ 0 \end{smallmatrix} \right] , \Sigma = \left[ \begin{smallmatrix} \sigma_0^2 & \rho \sigma_0 \sigma_1 & 0 \\ \rho \sigma_0 \sigma_1 & \sigma_1^2 & 0 \\ 0 & 0 & \sigma^2_{\epsilon} \end{smallmatrix} \right] \right)$ 
+
+For each peptide and for each treatment group, we test the following using the R package *lmerTest* \citep{lmerTest}:  
+
+$H_0$: $\beta_1 = 0$, ie. Treatment does not induce changes in antibody response over time.  
+$H_1$: $\beta_1 \neq 0$, ie. Treatment induces changes in antibody response over time.  
+
+**Rationale of the model**:  Since each patient has multiple measurements, the random effects of the mixed model allow us to capture the within-subject interdepencies. Every patient's antibody response is unique and possibly changes across time due to individual circumstances, so we want our model to include random intercept (representing patient-specific randomness) and random slope (of time). Since measurements were taken across only 3 time points, we refrain from considering more complicated terms involving time effect (eg. higher-order polynomial function of time). Furthermore, since sample size for each group is 8 (which is rather small), as a first step, we did not fit a more complicated model that considers vaccination schedules.  
+
+The F-test p-values were adjusted with Kenward-Roger (KR) or Satterthwaite method \citep{luke2017}. As reported in \citet{Potluri2020JITC},  KR seems to give more conservative adjustments.
+
+```{r, fig.width=8, fig.height=5}
+GM_Satterth_Ftest_pval <- GM_result[,"GM_Satterthwaite_Ftest_pval"]
+GM_KR_Ftest_pval <- GM_result[,"GM_KR_Ftest_pval"]
+noGM_Satterth_Ftest_pval <- noGM_result[,"noGM_Satterthwaite_Ftest_pval"]
+noGM_KR_Ftest_pval <- noGM_result[,"noGM_KR_Ftest_pval"]
+
+GM_Ftest_KR_BH <- p.adjust(GM_KR_Ftest_pval, method="BH")
+GM_Ftest_Satterthwaite_BH <- p.adjust(GM_Satterth_Ftest_pval, method="BH")
+noGM_Ftest_KR_BH <- p.adjust(noGM_KR_Ftest_pval,method="BH")
+noGM_Ftest_Satterthwaite_BH <- p.adjust(noGM_Satterth_Ftest_pval,method="BH")
+
+# fdrtool's eta0
+KR_eta0 <- unname(fdrtool(GM_KR_Ftest_pval, statistic = "pvalue", 
+                          verbose = F, plot  = F)$param[,"eta0"])
+Satter_eta0 <- unname(fdrtool(GM_Satterth_Ftest_pval, statistic = "pvalue", 
+                              verbose = F, plot  = F)$param[,"eta0"])
+
+par(mfrow=c(1,2))
+plot(GM_Satterth_Ftest_pval[GM_Satterth_Ftest_pval <= .2 & GM_KR_Ftest_pval <= .2], 
+     GM_KR_Ftest_pval[GM_Satterth_Ftest_pval <= .2 & GM_KR_Ftest_pval <= .2], 
+     pch = ".", xlim = c(0,.2), ylim = c(0,.2), las = 1, 
+     main = "Time Fixed Effect p-values \nfor vaccine + GM-CSF patients",
+     xlab = "Satterthwaite F-test p-values", 
+     ylab = "Kenward-Roger (KR) F-test p-values")
+abline(a=0, b=1, col = "red", lty=2, lwd = 2)
+
+plot(noGM_Satterth_Ftest_pval[noGM_Satterth_Ftest_pval <= .2 & noGM_KR_Ftest_pval <= .2], 
+     noGM_KR_Ftest_pval[noGM_Satterth_Ftest_pval <= .2 & noGM_KR_Ftest_pval <= .2], 
+     pch = ".", xlim = c(0,.2), ylim = c(0,.2), las = 1, 
+     main = "Time Fixed Effect p-values \nfor vaccine only (no GM-CSF) patients",
+     xlab = "Satterthwaite F-test p-values", 
+     ylab = "Kenward-Roger (KR) F-test p-values")
+abline(a=0, b=1, col = "red", lty=2, lwd = 2)
+```
+
+We now look at the p-value histograms that correspond to the 8 patients treated with vaccine + GM-CSF. 
+
+```{r, fig.height=5}
+KR_Ftest_pval_df <- data.frame(
+  treatment = c(
+    rep("GM", 177604*2),
+    rep("noGM", 177604*2)
+  ), 
+  method = rep( rep( c("Satterthwaite", "Kenward-Roger"), each = 177604 ), 2) ,
+  p_values = c(
+    GM_Satterth_Ftest_pval,
+    GM_KR_Ftest_pval,
+    noGM_Satterth_Ftest_pval,
+    noGM_KR_Ftest_pval
+  )
+)
+
+ggplot(KR_Ftest_pval_df[KR_Ftest_pval_df$treatment == "GM",], aes(x = p_values, fill = method)) +
+  geom_histogram(aes(y=..density..), bins = 70, position = "identity", alpha = .4) +
+  labs(x = "F-test p-values", 
+       title = "Density histograms of F-test p-values for Vaccine + GM-CSF group") + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom") + 
+  annotate("text", x = .5, y=1.8, 
+           label = paste0("Estimated proportion of non-null peptides = ",
+                          round(1 - KR_eta0,4)*100,"% based on KR F-test p-values" )) 
+```
+
+At first glance, the histogram appears to have an exponentially decaying shape, with many more peptides having smaller p-values. However, notice that there is a sharp cliff at the left of the histogram, suggesting not many peptides actually have very small (close to zero) p-values. We suspect that this might be due to the small sample size. After applying the Benjamini-Hochberg (BH) FDR control \citep{BHfdr}, no peptide turns out to be significant at 5\% FDR (in fact not even at 50\% FDR). We tabulate the peptide counts at various FDR thresholds based on KR p-values. 
+
+```{r}
+kable( count.func(GM_Ftest_KR_BH, seq(.2,.6,by=.05)),
+       format = "latex", row.names= NA, col.names = NA, booktabs = T )%>%
+  kable_styling(latex_options = c("hold_position")) %>%
+  row_spec(1, hline_after = T)
+```
+
+We also tabulate the peptide counts at various FDR thresholds based on Satterthwaite p-values. 
+
+```{r}
+kable( count.func(GM_Ftest_Satterthwaite_BH, seq(.2,.6,by=.05)),
+       format = "latex", row.names= NA, col.names = NA, booktabs = T )%>%
+  kable_styling(latex_options = c("hold_position")) %>%
+  row_spec(1, hline_after = T)
+```
+
+We also use Strimmer's method \citep{fdrtool} computed with the R package 'fdrtool' to estimate that 20.6\% of the 177604 peptides have non-null time effect, but the signal is not strong enough to show up after Benjamini-Hochberg (BH) FDR control.  
+
+We present a volcano plot to illustrate that this weak signal corresponds to peptides with increased log2 fluorescence (i.e. increased antibody responses) post-treatment. In the volcano plot, the red dots represent peptides with raw KR p-values smaller than 0.05 and an estimated fixed time effect greater than 0.333 (which corresponds to one fold increase post treatment).
+
+```{r, cache = T, fig.height=5}
+plot_eff <- GM_result[,"GM_time_effect"]
+plot_pval <- GM_result[,"GM_KR_Ftest_pval"]
+
+raw_cutoff <- which(plot_pval <= .05 & plot_eff >= .333)
+JITC_list <- read_csv("JITC_PAP_Longitudinal.csv")
+raw_cutoff_in_JITC <- dat_log2$PROBE_ID[raw_cutoff] %in% JITC_list$PROBE_ID
+plot_JITC_ind <- (dat_log2$PROBE_ID %in% JITC_list$PROBE_ID)
+
+plot(x = plot_eff, y = -log10(plot_pval), 
+     pch = ".", las = 1,
+     # ylim = c(0,9), xlim = c(-.4, .9),
+     xlab = "coefficient of time fixed effect", 
+     ylab = "-log10(KR F-test p-values)",
+     main = "Volcano Plot for Vaccine + GM-CSF group")
+lines(x = plot_eff[ plot_pval <= .05 & plot_eff >= .333 ], 
+      y = -log10(plot_pval[ plot_pval <= .05 & plot_eff >= .333 ]),
+      type = "p", pch = ".", col = "red")
+abline(v = 0.333, col = "blue", lty = 2)
+# abline(v = -0.333, col = "blue", lty = 2)
+abline(h = -log10(0.05), col = "blue", lty = 2)
+```
+
+There are `r length(raw_cutoff)` peptides which meet the (raw p-value < 0.05 and fold change > 1) cutoff, for which `r sum(as.numeric(raw_cutoff_in_JITC))` of them are also among the 5680 significant peptides reported in \citet{Potluri2020JITC}. 
+
+On the other hand, no significant time effect can be seen in the group of patients without GM-CSF.
+
+```{r, cache = T, fig.height=5}
+plot_eff2 <- noGM_result[,"noGM_time_effect"]
+plot_pval2 <- noGM_result[,"noGM_KR_Ftest_pval"]
+plot(x = plot_eff2, y = -log10(plot_pval2), 
+     pch = ".", las = 1,
+     xlim = c( min(plot_eff), max(plot_eff) ),
+     ylim = c( min(-log10(plot_pval)), max(-log10(plot_pval)) ),
+     xlab = "coefficient of time fixed effect", 
+     ylab = "-log10(KR F-test p-values)",
+     main = "Volcano Plot for Vaccine-only group (no GM)")
+lines(x = plot_eff2[ plot_pval2 <= .05 & plot_eff2 >= .333 ], 
+      y = -log10(plot_pval2[ plot_pval2 <= .05 & plot_eff2 >= .333 ]),
+      type = "p", pch = ".", col = "red")
+abline(v = 0.333, col = "blue", lty = 2)
+abline(h = -log10(0.05), col = "blue", lty = 2)
+```
+
+
+```{r, fig.height=4}
+ggplot(KR_Ftest_pval_df[KR_Ftest_pval_df$treatment == "noGM",], 
+       aes(x = p_values, fill = method)) +
+  geom_histogram(aes(y=..density..), bins = 70, position = "identity", alpha = .4) +
+  labs(x = "F-test p-values", 
+       title = "Density histograms of F-test p-values for the vaccine only (no GM-CSF) group") + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+```
+
+No significant peptides even at 50\% FDR.  We also did some analyses using local FDR \citep{locfdr} instead of BH FDR, and the results are consistent.  
+
+Finally, we plot another two volcano plots, where the red dots represent the 5680 peptides which were identified in \citet{Potluri2020JITC}.
+
+```{r, cache = T, fig.height=5}
+plot(x = plot_eff, y = -log10(plot_pval), 
+     pch = ".", las = 1,
+     # ylim = c(0,9), xlim = c(-.4, .9),
+     xlab = "coefficient of time fixed effect", 
+     ylab = "-log10(KR F-test p-values)",
+     main = "Volcano Plot for Vaccine + GM-CSF group")
+lines(x = plot_eff[ plot_JITC_ind ], 
+      y = -log10(plot_pval[ plot_JITC_ind ]),
+      type = "p", pch = ".", col = "red")
+abline(v = 0.333, col = "blue", lty = 2)
+# abline(v = -0.333, col = "blue", lty = 2)
+abline(h = -log10(0.05), col = "blue", lty = 2)
+```
+
+```{r, cache = T, fig.height=5}
+plot_eff2 <- noGM_result[,"noGM_time_effect"]
+plot_pval2 <- noGM_result[,"noGM_KR_Ftest_pval"]
+plot(x = plot_eff2, y = -log10(plot_pval2), 
+     pch = ".", las = 1,
+     xlim = c( min(plot_eff), max(plot_eff) ),
+     ylim = c( min(-log10(plot_pval)), max(-log10(plot_pval)) ),
+     xlab = "coefficient of time fixed effect", 
+     ylab = "-log10(KR F-test p-values)",
+     main = "Volcano Plot for Vaccine-only group (no GM)")
+lines(x = plot_eff2[ plot_JITC_ind ], 
+      y = -log10(plot_pval2[ plot_JITC_ind ]),
+      type = "p", pch = ".", col = "red")
+abline(v = 0.333, col = "blue", lty = 2)
+abline(h = -log10(0.05), col = "blue", lty = 2)
+```
+
+For the vaccine-only group without GM-CSF, the 5680 JITC peptides had large KR F-test p-values and/or small coefficient of time fixed-effect. For the vaccine + GM-CSF group, the 5680 peptides generally showed larger time fixed-effect and smaller p-values.  
+
+In short, this smaller data set reinforces our earlier findings: antibody responses across time were brought about by GM-CSF, albeit the fact that the effect is not strong enough to show up in this smaller study.   
+
+
+
+\bibliography{AR_trial} 
