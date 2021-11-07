@@ -1,0 +1,284 @@
+---
+title: | 
+  | sipuleucel-T Trial: Comparing 
+  | sip-T + pTVG-HP vs sip-T only
+author: "Tun Lee Ng and Michael A. Newton"
+date: "January 2021"
+output: 
+  pdf_document:
+    toc: true
+    number_sections: true
+    citation_package: natbib
+link-citations: true
+linkcolor: blue
+header-includes:
+   \usepackage{enumerate}
+   \usepackage{amsmath}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+```
+
+# Introduction 
+
+To recap, we found no significant difference in fold changes of peptide fluorescence between 2 groups of patients (total sample size = 92) -- one group (47 patients) administered with vaccine + GM-CSF, another (45 patients) with GM-CSF only -- in a blinded randomized trial. In another smaller study (total sample size = 16) where patients were either given vaccine + GM-CSF or vaccine only without GM-CSF, an increase in antibody response was observed in the former group, but the signal was not strong enough to be deemed significant after FDR control, possibly due to small sample size. These results suggest that antibody responses are due to GM-CSF.  
+
+In this study, we have samples from patients treated with sipuleucel-T (a vaccine engineered with GM-CSF chemically fused to PAP used to stimulate cells ex vivo).  Others have reported antibody “off-target” effects from treatment with sipuleucel-T.  In the trial from which we have samples and peptide data, patients received sip-T alone (group A: sample size = 9) or sip-T followed by DNA vaccine pTVG-HP (group B: sample size = 9). We would be interested to see if antibody responses are similarly elicited following sip-T treatment, and whether they correspond to the same actual proteins/peptides that we previously identified in \citet{Potluri2020JITC}.  That would suggest that some/all of the antibody responses following sip-T published by others may actually be from GM-CSF.   
+
+Peptide array data were obtained at 2 different time points: pre and 6 months post treatment (there were 2 patients -- ID018 in group A and ID008 in group B -- whose data were collected 3 months post treatment). We applied a log2 transformation of the peptide fluorescence data, and we verified that the peptide array data were normalized accordingly via the boxplots of log2 fluorescence level of all peptides for each patient. We then obtained the difference (after - before) of the log2 fluorescence levels for each patient and each peptide.       
+
+```{r}
+library(tidyverse)
+library(RColorBrewer)
+library(fdrtool)
+library(gridExtra)
+library(kableExtra)
+library(dendextend) # dendrogram
+library(Rtsne)
+
+
+# specified color and shape scheme 
+pal <- c("navy", "darkorange1")
+names(pal) <- c("A",  "B")
+shp <- c(8, 16)
+names(shp) <- names(pal)
+
+# function to plot PCA loadings
+PCload.func <- function(cols, shapes, U, D, x, y, pca.vec, title){
+  Z <- U %*% diag(D)
+  plot(Z[,x], Z[,y], col = cols, pch = shapes, main = title, las = 1,
+       xlab = paste0("PC",x," (", round(pca.vec[x]*100, 1) ,"% variance explained)"),
+       ylab = paste0("PC",y," (", round(pca.vec[y]*100, 1) ,"% variance explained)") 
+  )
+}
+
+
+# function to count peptides at different FDR thresholds
+count.func <- function(pval.vec, thresh.vec){
+  counter <- NULL
+  for (i in thresh.vec ){
+    counter <- c(counter, length(pval.vec[pval.vec <= i]))
+  }
+  countab <- rbind(c("FDR threshold", thresh.vec),
+                   c("Peptide counts", counter))
+  return(countab)
+}
+
+# load t-test & Wilcoxon rank-sum test results
+load("sipT_results.RData")
+load("sipT_muB.RData")
+load("sipT_all.RData")
+```
+
+```{r, cache = T}
+# read array data
+dat <- read_csv("MCV_data.csv")
+
+# read sample data
+samp <- read_csv("MCV_samples.csv")
+
+# rearrange rows in samp
+samp <- samp %>%
+  arrange(desc(Time), Group, desc(Period), Patient_ID)
+
+# rearrange columns in dat
+arr_iii <- match( samp$Array_ID, colnames(dat[,4:ncol(dat)]) )
+dat <- dat[, c(1:3, arr_iii+3)]
+
+# take log2 then find take (post - pre)
+dat2 <- log2( dat[,4:ncol(dat)] )
+dat2 <- dat2[,(ncol(dat2)/2 + 1):ncol(dat2)] - dat2[,1:(ncol(dat2)/2)] 
+colnames(dat2) <- samp$Patient_ID[1:ncol(dat2)]
+dat2 <- cbind(dat$PROBE_ID, dat$SEQ_ID, dat2)
+
+# get data frame ready for boxplot to verify normalization
+long_dat <- log2(dat[,4:ncol(dat)]) 
+colnames(long_dat) <- paste( samp$Patient_ID, samp$Time, sep = "_" )
+long_dat <- long_dat %>% 
+  pivot_longer(cols = everything(), names_to = "id_time", 
+               values_to = "log2_fluorescence") 
+
+# set fill color
+long_dat$group_time <- factor(rep(paste(samp$Group,samp$Time,sep="_"), nrow(dat2)))
+
+# sort order of patients in boxplot
+long_dat$id_time <- factor(long_dat$id_time, levels = paste( samp$Patient_ID, samp$Time, sep = "_" ))
+```
+
+```{r, cache=T, fig.height = 5}
+# set boxplot color
+boxplot_pal <- brewer.pal(9,"Set1")[c(2,6,7,5)]
+names(boxplot_pal) <- levels(long_dat$group_time )
+
+ggplot(long_dat, aes(x = id_time, y = log2_fluorescence, fill = group_time)) +
+  geom_boxplot(outlier.shape = ".") +
+  scale_fill_manual(name = "group_time", 
+                    values = boxplot_pal[levels(long_dat$group_time)]) +
+  labs(title = "Boxplots of Peptide Fluorescence Levels for Patients (pre- and post- treatment) ", 
+       x = "Patient_Time", y = "Log2 Fluorescence Levels") +
+  theme(panel.background = element_rect(fill = "grey90"),
+        panel.grid.major = element_line(color = "white"),
+        panel.grid.minor = element_line(color = "white"),
+        axis.text.x = element_text(angle = 90, hjust = 1, size = 5),
+        legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5))
+```
+
+# Preliminary Analysis
+
+```{r}
+# colors and shapes for the visualization techniques
+cols = pal[ match(samp$Group[samp$Time == "Post"], names(pal)) ]
+shapes = shp[ match(samp$Group[samp$Time == "Post"], names(shp)) ]
+```
+
+We visualize these log2(fluorescence) differences using:  
+* hierarchical clustering dendrogram  
+* PCA plot  
+* t-SNE plot \citep{tsne}  
+
+```{r, cache = T, fig.height = 3.8}
+clust.dat <- t(dat2[,3:ncol(dat2)])
+hc_average <- hclust(dist(clust.dat), "average")
+dend <- as.dendrogram(hc_average)
+
+# coloring
+labels_colors(dend) <- cols[order.dendrogram(dend)]
+par(cex=.7)
+plot(dend, xlab = "Patients", ylab = "Dissimilarity")
+```
+
+From the hierarchical clustering dendrogram (using average linkage), it appears that patients ID004, ID005, ID006, ID007, ID008 and ID010 are clustered away from other patients. We observe similar patterns in the PCA plot as well as the t-SNE (t-distributed stochastic neighbor embedding) plot.  
+
+```{r, cache = T, fig.height=3.8}
+# svd
+sv.dat <- sweep(t(dat2[,3:ncol(dat2)]), 2, colMeans(t(dat2[,3:ncol(dat2)])), "-") # centering
+sv <- svd(sv.dat)
+V <- sv$v
+D <- sv$d
+U <- sv$u
+
+# variance explained
+pca.var <- D^2/sum(D^2) 
+pca.cumvar <- cumsum(pca.var)
+
+# plot PCA
+par(mfrow = c(1,2), pty = "s", mar = c(2.2,2.3,1.5,0.45), mgp = c(1.6,0.4,0),cex=.5,
+    cex.axis = 0.84, cex.lab = 0.84, cex.main = 0.84, tcl = -0.4)
+PCload.func(cols, shapes, U, D, 1, 2, pca.var, title = "PC2 vs PC1") # PC loadings (PC2 vs PC1)
+legend('bottomright', pch = shp, col = pal, c("A",  "B") )
+PCload.func(cols, shapes, U, D, 3, 2, pca.var, title = "PC2 vs PC3") # PC loadings (PC2 vs PC3)
+legend('bottomright', pch = shp, col = pal, c("A",  "B") )
+```
+
+```{r, cache=T, fig.height = 4.5, fig.width=8}
+# how to specify parameter
+# refer: https://lvdmaaten.github.io/tsne/User_guide.pdf
+tsnedat <- unname(t(dat2[,3:ncol(dat2)])) # dim(X) = N samples by D dimensions 
+initdim <- 18 
+perplex <- 5 
+lab <- row.names(t(dat2[,3:ncol(dat2)]))
+
+set.seed(10)
+tsne_raw <- Rtsne(tsnedat, dims = 2L, initial_dims = initdim, perplexity = perplex,
+                  theta = 0, check_duplicates = F, PCA = T)
+
+# t-SNE plot
+plot(tsne_raw$Y,t = "n", ylab = "", xlab = "", 
+     main = "t-SNE plot")
+text(tsne_raw$Y, labels=lab, col=cols)
+```
+
+Otherwise, there does not seem to be clear-cut clustering effect separating groups A (sip-T only) and B (sip-T + vaccine).  
+
+# Statistical Tests
+
+Let $\mu_{A,p}$ and $\mu_{B,p}$ be the average difference (after - before) in log2 fluorescence levels, for the sip-T group (denoted A) and the sip-T + vaccine group (denoted B) respectively, for the $p^{th}$ peptide, where $p = 1, \cdots, 177604$. For each peptide $p$, we test the following hypotheses 
+
+$H_0$: $\mu_{A,p} = \mu_{B,p}$  
+$H_1$: $\mu_{A,p} \neq \mu_{B,p}$  
+
+using both 2-sample t-test and Wilcoxon rank-sum test. We repeat the tests to include or exclude the patients (ID018 in group A and ID008 in group B) whose data was collected at different time points from the rest of the patients. Regardless, in all cases, there dont appear to be any signal about different antibody responses between the two groups of patients. As expected, no peptide appears significant after Benjamini-Hochberg FDR control \citep{BHfdr}.  
+
+```{r, fig.width=8, fig.height=5}
+par(mfrow=c(1,2))
+hist(pval_drop, xlab = "t-test p-val", freq = F, 
+     main = "t-test p-value histogram \n(Exclude 3-month patients)")
+hist(Wilcox_pval_drop, xlab = "Wilcox p-val", freq = F, 
+     main = "Wilcoxon-test p-value histogram \n(Exclude 3-month patients)")
+```
+
+```{r, fig.width=8, fig.height=5}
+par(mfrow=c(1,2))
+hist(pval, xlab = "t-test p-val", freq = F, 
+     main = "t-test p-value histogram \n(include all patients)")
+hist(Wilcox_pval, xlab = "Wilcox p-val", freq = F, 
+     main = "Wilcoxon-test p-value histogram \n(include all patients)")
+```
+
+# Compare with JITC results
+
+We tabulate  
+* the overall mean and studentized fold changes  
+* the respective mean and studentized fold changes for the 2 treatment groups  
+for all 177,604 peptides in Excel spreadsheet "fold_change_all_peptides.csv". Meanwhile, \citet{Potluri2020JITC} reported 5680 significant peptides associated with the comparison between the vaccine + GM-CSF (PAP) group and the androgen-deprivation (ADT) group. The spreadsheet "fold_change_all_peptides.csv" has a column that marks these 5680 significant peptides reported in the JITC paper.  
+
+We now plot the frequency histogram and density histograms of the mean (and studentized) fold changes between the 5680 JITC-reported peptides and all the other remaining peptides.
+
+```{r}
+compare_df <- read_csv("fold_change_all_peptides.csv")
+JITC_list <- read_csv("JITC_PAP_Longitudinal.csv")
+
+compare_plot.func <- function(colmn, xlab, denshist_xmin, denshist_xmax, denshist_ymin, denshist_ymax){
+  df <- data.frame(
+    val = colmn,
+    JITC_signif = as.factor(compare_df$JITC_signif)
+  )
+  
+  grid.arrange(
+    ggplot(df, aes(x = val, fill = JITC_signif)) +
+      geom_histogram(aes(y=..density..), bins = 70, position = "identity", alpha = .4) +
+      labs(x = xlab, title = paste0("Density histograms of \n", xlab)) + 
+      xlim(denshist_xmin, denshist_xmax) + ylim(denshist_ymin, denshist_ymax) +
+      theme(plot.title = element_text(hjust = 0.5),
+            legend.position = "bottom"),
+    ggplot(df, aes(x = val, fill = JITC_signif)) +
+      geom_histogram(bins = 70, position = "identity", alpha = .4) +
+      labs(x = xlab, title = paste0("Frequency histograms of \n", xlab)) + 
+      theme(plot.title = element_text(hjust = 0.5),
+            legend.position = "bottom"),
+    ncol = 2
+  )
+}
+```
+
+\newpage
+
+```{r, fig.width=8}
+compare_plot.func(compare_df$mean_A, "mean fold changes (group A)", -2.5, 3, 0, 1.5)
+```
+
+```{r, fig.width=8}
+compare_plot.func(compare_df$studentized_A, "studentized fold changes (group A)", -2, 2, 0, 2.5)
+```
+
+```{r, fig.width=8}
+compare_plot.func(compare_df$mean_B, "mean fold changes (group B)", -2.5, 3, 0, 1.5)
+```
+
+```{r, fig.width=8}
+compare_plot.func(compare_df$studentized_B, "studentized fold changes (group B)", -2, 2, 0, 2.5 )
+```
+
+```{r, fig.width=8}
+compare_plot.func(compare_df$mean_overall, "mean fold changes (all patients)", -1.5, 2.5, 0, 1.75)
+```
+
+```{r, fig.width=8}
+compare_plot.func(compare_df$studentized_overall, "studentized fold changes (all patients)", -1.7, 1.5, 0, 3)
+```
+
+
+
+\bibliography{sipT} 
