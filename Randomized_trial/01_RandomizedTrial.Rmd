@@ -1,0 +1,470 @@
+---
+title: | 
+  | Randomized Trial: Comparing 
+  | Vaccine + GM-CSF vs GM-CSF only
+author: "Tun Lee Ng and Michael A. Newton"
+date: "November 6, 2020"
+output: 
+  pdf_document:
+    toc: true
+    number_sections: true
+    citation_package: natbib
+link-citations: true
+linkcolor: blue
+header-includes:
+   \usepackage{enumerate}
+   \usepackage{amsmath}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+```
+
+# Introduction 
+
+\citet{Potluri2020JITC} reported that people with early recurrent prostate cancer treated with vaccine + GM-CSF (pTVG-HP) had IgG to multiple peptides/proteins – not seen in patients treated with androgen deprivation. In this blinded randomized trial, 92 patients with the same stage of disease were treated with vaccine + GM-CSF (47 patients) or GM-CSF only (45 patients). We compared changes of peptide levels between these two groups of patients.  
+
+We collected blood at baseline and at 12 weeks and looked for antibodies to the same peptide array used in \citet{Potluri2020JITC} with twice the density of spots -- duplicates for every peptide on the same array (177,604 peptides $\times$ 2). We applied a log2 transformation of the peptide fluorescence data, and compute the mean (which, in this case, is equal to the median) log2 fluorescence levels of the same peptides. We verified that the peptide array data were normalized accordingly via the boxplots of mean (over duplicate peptides) log2 fluorescence level of all peptides for each patient. We then obtained the difference (after - before) of the log2 fluorescence levels for each patient and each peptide.        
+
+```{r}
+library(Rtsne)
+library(fdrtool)
+library(dendextend) # dendrogram
+library(ggplot2)
+library(ashr)
+library(tidyverse)
+library(kableExtra)
+library(gridExtra)
+
+# load results
+load("t_test_wilcox_test_pvals_log2.RData")
+# load("t_test_wilcox_test_pvals_log2log2.RData")
+
+####################################################################################### 
+#                           Some Common Variables and Functions                       #
+####################################################################################### 
+
+# specified color and shape scheme 
+pal <- c("navy", "darkorange1")
+names(pal) <- c("GM",  "pTVG-HP")
+shp <- c(8, 16)
+names(shp) <- names(pal)
+
+# function to plot PCA loadings
+PCload.func <- function(cols, shapes, U, D, x, y, pca.vec, title){
+  Z <- U %*% diag(D)
+  plot(Z[,x], Z[,y], col = cols, pch = shapes, main = title, las = 1,
+       xlab = paste0("PC",x," (", round(pca.vec[x]*100, 1) ,"% variance explained)"),
+       ylab = paste0("PC",y," (", round(pca.vec[y]*100, 1) ,"% variance explained)") 
+  )
+}
+
+
+# function to count peptides at different FDR thresholds
+count.func <- function(pval.vec, thresh.vec){
+  counter <- NULL
+  for (i in thresh.vec ){
+    counter <- c(counter, length(pval.vec[pval.vec <= i]))
+  }
+  countab <- rbind(c("Threshold", thresh.vec),
+                   c("Peptide counts", counter))
+  return(countab)
+}
+
+# typical step in analysis
+analysis_func <- function(pval, xlab){
+  # control FDR
+  anova_BH <- p.adjust(pval, method = "BH")
+  anova_qval <- fdrtool(pval, statistic = "pvalue", verbose = F, plot  = F)$qval
+  anova_qval_eta0 <- unname(fdrtool(pval, statistic = "pvalue", 
+                                    verbose = F, plot  = F)$param[,"eta0"])
+  
+  # plot histogram of p-values
+  all_peptide_hist <- hist(pval, breaks = 70, freq = F, xlab = xlab, las = 1,  
+                           main = paste0("Histogram of ", xlab))
+  return(list(BH = anova_BH, qval = anova_qval, qval_eta0 = anova_qval_eta0))
+}
+
+# post-process allez table for kable output
+get_alleztable.func <- function(allez_go_input){
+  allez.tab <- allezTable(allez_go_input, symbol = T, nominal.alpha = nom.alpha, 
+                          n.upp = max_gene_in_set, in.set = T)
+  allez.tab$set.size <- paste(allez.tab$in.set, allez.tab$set.size, sep = "/")
+  allez.tab <- allez.tab %>% dplyr::select(-c(in.set, genes)) %>%
+    mutate(in.genes = str_replace_all(in.genes, ";", "; "))
+  return(allez.tab)
+}
+```
+
+```{r, cache = T}
+####################################################################################### 
+#                                      Setup Dataset                                  #
+####################################################################################### 
+
+# read peptide array data
+dat <- read_tsv("Aggregate_processed_data/Processed_aggregate_data.txt")
+
+# unify column names
+colnames(dat)[30:33] <- paste0( substr(colnames(dat)[30:33],1,10),
+                                substr(colnames(dat)[30:33],18,29) )
+colnames(dat)[94:133] <- paste0( substr(colnames(dat)[94:133],1,10),
+                                 substr(colnames(dat)[94:133],18,29) )
+
+# remove redundant substring of colnames
+colnames(dat)[18:207] <- paste0( substr(colnames(dat)[18:207],1,7),
+                                 substr(colnames(dat)[18:207],16,22) )
+
+# duplicates for every peptide 
+# take log2 transformation
+# collapse rows by mean (aka median since only 2 duplicates)
+dat_log2 <- dat
+dat_log2 <- dat_log2 %>% 
+  mutate_at(vars(contains(".dat")), log2)
+
+# arrange rows by PROBE_ID then ROW_NUM then COL_NUM
+dat_log2 <- dat_log2 %>% 
+  arrange(PROBE_ID, ROW_NUM, COL_NUM) 
+
+# extract odd rows and even rows
+dat_odd_rows <- dat_log2[seq(1, nrow(dat_log2)-1, by = 2), ]
+dat_even_rows <- dat_log2[seq(2, nrow(dat_log2), by = 2), ]
+
+# mean 
+collapsed_dat <- (dat_odd_rows[, 18:207] + dat_even_rows[, 18:207])/2
+
+# get unique probe ID
+collapsed_dat <- cbind(dat_odd_rows[,"PROBE_ID"], collapsed_dat)
+
+# remove unnecessary data frames to free up memory
+rm(dat_odd_rows, dat_even_rows, dat_log2)
+
+#-----------------------------------------------------------------------
+# read samples/patients data
+sample_dat <- read_csv("sample_data.csv")
+
+# exclude PAP099, PAP124, PAP071, PAP096, PAP092, and PAP118
+to_exclude <- sample_dat[sample_dat$"Sample_ID" %in% 
+                           c("PAP099", "PAP124", "PAP071", "PAP096", "PAP092", "PAP118"),]
+
+collapsed_dat <- collapsed_dat %>%
+  select(- matches(to_exclude$Colnames))
+sample_dat <- sample_dat %>%
+  filter(Patient_ID != "ignore")
+rm(to_exclude)
+
+# desired columns of ref_data_frame: patient ID, before/after, array ID
+# desired rows of ref_data_frame: arranged according to before/after, then patient ID
+# arrange the columns of collapsed_dat to the rows of this desired ref_data_frame
+sample_dat <- sample_dat %>%
+  arrange(Before_After, Patient_ID)
+
+# arrange columns of collapsed_dat 
+iii <- match( sample_dat$Colnames, 
+              colnames( collapsed_dat[, ! (names(collapsed_dat) %in% "PROBE_ID")] ) )
+collapsed_dat <- collapsed_dat[, c(1, iii+1)]
+```
+
+```{r, cache = T, fig.height = 5}
+# check normalization of peptide array 
+
+after_ind <- (1 : (nrow(sample_dat)/2))
+before_ind <- ((nrow(sample_dat)/2 + 1) : nrow(sample_dat))
+after_dat <- collapsed_dat[, after_ind + 1]
+before_dat <- collapsed_dat[, before_ind + 1]
+colnames(after_dat) <- sample_dat$Patient_ID[sample_dat$Before_After == "After"]
+colnames(before_dat) <- sample_dat$Patient_ID[sample_dat$Before_After == "Before"]
+
+# for subsequent analysis (after - before)
+diff_mat <- as.matrix(after_dat - before_dat)
+colnames(diff_mat) <- sample_dat$Patient_ID[sample_dat$Before_After == "After"]
+row.names(diff_mat)<- collapsed_dat$PROBE_ID
+
+# get after_dat's column median 
+# to arrange patients in boxplots later
+col_med_after <- sort(apply(after_dat, 2, median))
+col_seq <- names(col_med_after)
+
+after_dat <- after_dat %>%
+  pivot_longer(cols = everything(), names_to = "Patient", 
+               values_to = "Log2_Expression")
+before_dat <- before_dat %>%
+  pivot_longer(cols = everything(), names_to = "Patient", 
+               values_to = "Log2_Expression")
+after_dat$Time <- "After"
+before_dat$Time <- "Before"
+
+# get df
+combined <- rbind(after_dat, before_dat)
+rm(after_dat, before_dat, after_ind, before_ind, col_med_after)
+
+# arrange sequence of patients
+combined$Patient <- factor(combined$Patient, levels = col_seq)
+
+ggplot(combined, aes(x = Patient, y = Log2_Expression, fill = Time)) +
+  geom_boxplot(outlier.shape = ".", position = position_dodge2(preserve = "single")) +
+  labs(title = "Boxplots of Log2 Peptide Expression of Patients", 
+       x = "Patient", y = "Log2 peptide expression (averaged across duplicates)") +
+  theme(panel.background = element_rect(fill = "grey90"),
+        panel.grid.major = element_line(color = "white"),
+        panel.grid.minor = element_line(color = "white"),
+        axis.text.x = element_text(angle = 90, hjust = 1, size = 2.5),
+        legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5))
+```
+
+# Preliminary Analysis
+
+```{r}
+# colors and shapes for the visualization techniques
+cols = pal[ match(sample_dat$Treatment[sample_dat$Before_After == "After"], 
+                  names(pal)) ]
+shapes = shp[ match(sample_dat$Treatment[sample_dat$Before_After == "After"], 
+                    names(shp)) ]
+```
+
+We visualize these log2(fluorescence) differences using:  
+* hierarchical clustering dendrogram  
+* PCA plot  
+* t-SNE plot \citep{tsne}  
+
+\textit{A small note on data-processing:} In order to minimize character counts to distinguish the patients (data points) in the plots, I renamed the patient identifiers, as listed in "Patient_Rename.csv". For example, "UW pt 1" that appeared in "List of Sera Samples - phase 2 trial and replicates.xlsx" was renamed as "UW01"; whereas other patient records that appeared in "Sample_Submission_Sheet_PA-218.xlsx", such as "300015", was renamed as "pt60", and so on.  
+
+## Hierarchical Clustering 
+
+```{r, cache=T}
+clust.dat <- t(diff_mat)
+hc_average <- hclust(dist(clust.dat), "average")
+dend <- as.dendrogram(hc_average)
+```
+
+```{r, fig.height = 3.8}
+# coloring
+labels_colors(dend) <- cols[order.dendrogram(dend)]
+par(cex=.4)
+plot(dend, xlab = "Patients", ylab = "Dissimilarity")
+```
+
+Patients such as "pt78", "pt79", "pt80" and "pt86" are clustered away from other patients. This pattern is consistent with the PCA plots displayed below.
+
+## PCA
+```{r, cache = T}
+# svd
+sv.dat <- sweep(t(diff_mat), 2, colMeans(t(diff_mat)), "-") # centering
+sv <- svd(sv.dat)
+V <- sv$v
+D <- sv$d
+U <- sv$u
+
+# variance explained
+pca.var <- D^2/sum(D^2) 
+pca.cumvar <- cumsum(pca.var)
+```
+
+```{r, fig.height=3.8}
+par(mfrow = c(1,2), pty = "s", mar = c(2.2,2.3,1.5,0.45), mgp = c(1.6,0.4,0),cex=.5,
+    cex.axis = 0.84, cex.lab = 0.84, cex.main = 0.84, tcl = -0.4)
+PCload.func(cols, shapes, U, D, 1, 2, pca.var, title = "PC2 vs PC1") 
+legend('topright', pch = shp, col = pal, c("GM",  "pTVG-HP") )
+PCload.func(cols, shapes, U, D, 3, 2, pca.var, title = "PC2 vs PC3") 
+```
+
+Most of the patients are cluttered together, except for the 4 aforementioned patients. We now zoom in this crowd of patients.
+
+```{r, fig.height=3.8}
+# zoomed-in PCA plot
+PCload.func2 <- function(cols, shapes, U, D, x, y, pca.vec, title, xlim, ylim){
+  Z <- U %*% diag(D)
+  plot(Z[,x], Z[,y], col = cols, pch = shapes, main = title, las = 1, xlim = xlim, ylim = ylim,
+       xlab = paste0("PC",x," (", round(pca.vec[x]*100, 1) ,"% variance explained)"),
+       ylab = paste0("PC",y," (", round(pca.vec[y]*100, 1) ,"% variance explained)") 
+  )
+}
+
+par(mfrow = c(1,2), pty = "s", mar = c(2.2,2.3,1.5,0.45), mgp = c(1.4,0.4,0), cex=.5,
+    cex.axis = 0.84, cex.lab = 0.84, cex.main = 0.84, tcl = -0.4)
+PCload.func2(cols, shapes, U, D, 1, 2, pca.var, 
+             title = "PC1 vs PC2", xlim = c(-40,30), ylim = c(-60,70)) 
+legend('bottomright', pch = shp, col = pal, c("GM",  "pTVG-HP") )
+PCload.func2(cols, shapes, U, D, 3, 2, pca.var, 
+             title = "PC3 vs PC2", xlim = c(-250,250), ylim = c(-60,70)) 
+legend('bottomright', pch = shp, col = pal, c("GM",  "pTVG-HP") )
+```
+
+Just like the dendrogram, it does not appear to have clear distinction between the two groups of patients, which we also observe in the t-SNE (t-distributed stochastic neighbor embedding) plot displayed below.
+
+## t-SNE
+
+```{r, cache=T, fig.height = 4}
+# how to specify parameter
+# refer: https://lvdmaaten.github.io/tsne/User_guide.pdf
+tsnedat <- unname(t(diff_mat)) # dim(X) = N samples by D dimensions 
+initdim <- 90 
+perplex <- 30 
+lab <- row.names(t(diff_mat))
+
+set.seed(10)
+tsne_raw <- Rtsne(tsnedat, dims = 2L, initial_dims = initdim, perplexity = perplex,
+                  theta = 0, check_duplicates = F, PCA = T)
+
+# t-SNE plot
+plot(tsne_raw$Y, ylab = "", xlab = "", main = "t-SNE plot", cex = .7, 
+     col = cols, pch = shapes)
+legend('topright', pch = shp, col = pal, c("GM",  "pTVG-HP"), cex = .7 )
+```
+
+# Statistical Tests
+
+Let $\mu_{A,p}$ and $\mu_{B,p}$ be the average difference (after - before) in log2 fluorescence levels, for the vaccine+GM-CSF group (denoted A) and the GM-CSF only group (denoted B) respectively, for the $p^{th}$ peptide, where $p = 1, \cdots, 177604$. For each peptide $p$, we test the following hypotheses 
+
+$H_0$: $\mu_{A,p} = \mu_{B,p}$  
+$H_1$: $\mu_{A,p} \neq \mu_{B,p}$  
+
+using both 2-sample t-test and Wilcoxon rank-sum test. We plot the p-value histograms as follows. 
+
+```{r, fig.width=8, fig.height=4}
+par(mfrow = c(1,2))
+t_test_analysis <- analysis_func(t_test_pval, "t-test p-values")
+wilcox_analysis <- analysis_func(wilcox_pval, "wilcoxon test p-values")
+```
+
+The shape of both p-value histograms is rather flat/uniform, suggesting a lack of clear signal or significant differences between the two groups of patients in terms of changes in peptide levels after treatment.  
+
+We apply the Benjamini-Hochberg (BH) method \citep{BHfdr} on the t-test p-values to control for false discovery rate (FDR).  
+
+```{r}
+kable( count.func(t_test_analysis$BH, seq(0.05, 0.5, by = 0.05)),
+       format = "latex", row.names= NA, col.names = NA, booktabs = T )%>%
+  kable_styling(latex_options = c("hold_position")) %>%
+  row_spec(1, hline_after = T)
+```
+
+No peptides turn out to be significant (even at 50\% FDR) based on t-tests after controlling for FDR. We arrive at the same result for the Wilcoxon BH-adjusted p-values.
+
+```{r}
+kable( count.func(wilcox_analysis$BH, seq(0.05, 0.5, by = 0.05)),
+       format = "latex", row.names= NA, col.names = NA, booktabs = T )%>%
+  kable_styling(latex_options = c("hold_position")) %>%
+  row_spec(1, hline_after = T)
+```
+
+We also deploy the Adaptive Shrinkage (ASH) analysis \citep{ASH}, which is an  empirical Bayes approach that adopts a unimodal prior that leads to shrinkage estimation adaptive to amount of signal (effect) and measurement precision (standard error). The ASH analysis also computes the ``local false sign rate (LFSR)``: the probability of getting the sign of an effect wrong. It is analogous to to ``local false discovery rate``, but measures confidence in the sign of each effect rather than confidence in each effect being non-zero. Whereas small (local) FDR indicates that we can be confident the estimated effect is non-zero, small LFSR indicates that we can be confident about the sign of the estimated effect. Of course, being confident in the sign of an effect implies that we are confident it is non-zero (but not the other way), hence the reason why LFSR is usually more liberal.  
+
+Specifically, for each peptide $p$, we measure its associated "effect" as $\hat{\mu}_{A,p} - \hat{\mu}_{B,p}$, and we take the standard error term in the 2-sample t-tests as the standard error for ``lfsr`` calculation done using the R package ``ashr`` \citep{ashr}.. From the lfsr histogram, it seems that there is no significant difference between the two groups of patients.  
+
+```{r,fig.height=4}
+hist(ash_lfsr, breaks = 50, xlab = "local false sign rates (LFSR)", 
+     main = "Histogram of local false sign rates (LFSR) \nfrom Adaptive Shrinkage (ASH) method")
+```
+
+# Compare with JITC results
+
+All previous analyses indicate that there appears to be no evidence of significant difference between the two treatment groups in terms of peptide fold changes (before and after treatment).  
+
+We tabulate  
+* the overall mean and studentized (across all 94 patients) fold changes  
+* the respective mean and studentized fold changes for the 2 treatment groups  
+* t-test p-values  
+* Wilcoxon p-values  
+for all 177,604 peptides in Excel spreadsheet "fold_change_all_peptides.csv". Meanwhile, \citet{Potluri2020JITC} reported 5680 significant peptides associated with the comparison between the vaccine + GM-CSF (PAP) group and the androgen-deprivation (ADT) group. The spreadsheet "fold_change_all_peptides.csv" has a column that marks these 5680 significant peptides reported in the JITC paper.  
+
+We now plot the frequency histogram and density histograms of the overall mean fold changes and overall studentized fold changes between the 5680 JITC-reported peptides and all the other remaining peptides.
+
+```{r, fig.width=8}
+JITC_list <- read_csv("JITC_PAP_Longitudinal.csv")
+tab <- read_csv("fold_change_all_peptides.csv")
+
+compare_hist_df <- data.frame(
+  mean_fold_changes = tab$overall_mean,
+  JITC_signif = as.factor(tab$JITC_signif)
+)
+
+grid.arrange(
+  ggplot(compare_hist_df, aes(x = mean_fold_changes, fill = JITC_signif)) +
+  geom_histogram(aes(y=..density..), bins = 100, position = "identity", alpha = .4) +
+  labs(x = "mean fold changes", 
+       title = paste0("Density Histograms of Mean Fold Changes")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom"),
+  ggplot(compare_hist_df, aes(x = mean_fold_changes, fill = JITC_signif)) +
+  geom_histogram(bins = 100, position = "identity", alpha = .4) +
+  labs(x = "mean fold changes", 
+       title = paste0("Frequency Histograms of Mean Fold Changes")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom"),
+  ncol = 2
+)
+```
+
+```{r, fig.width=8}
+compare_hist_df3 <- data.frame(
+  studentized_fold_changes = tab$overall_studentized,
+  JITC_signif = as.factor(tab$JITC_signif)
+)
+
+grid.arrange(
+  ggplot(compare_hist_df3, aes(x = studentized_fold_changes, fill = JITC_signif)) +
+  geom_histogram(aes(y=..density..), bins = 100, position = "identity", alpha = .4) +
+  labs(x = "studentized fold changes", 
+       title = paste0("Density Histograms of studentized Fold Changes")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom"),
+  ggplot(compare_hist_df3, aes(x = studentized_fold_changes, fill = JITC_signif)) +
+  geom_histogram(bins = 100, position = "identity", alpha = .4) +
+  labs(x = "studentized fold changes", 
+       title = paste0("Frequency Histograms of studentized Fold Changes")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom"),
+  ncol = 2
+)
+```
+
+We also plot the frequency histogram and density histograms of the mean fold changes and overall studentized fold changes of the vaccine + GM-CSF group between the 5680 JITC-reported peptides and all the other remaining peptides.
+
+```{r, fig.width=8}
+compare_hist_df2 <- data.frame(
+  mean_fold_changes = tab$`mean_in_group_pTVG-HP`,
+  JITC_signif = as.factor(tab$JITC_signif)
+)
+
+grid.arrange(
+  ggplot(compare_hist_df2, aes(x = mean_fold_changes, fill = JITC_signif)) +
+  geom_histogram(aes(y=..density..), bins = 100, position = "identity", alpha = .4) +
+  labs(x = "mean fold changes", 
+       title = paste0("Density Histograms of Mean Fold Changes")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom"),
+  ggplot(compare_hist_df2, aes(x = mean_fold_changes, fill = JITC_signif)) +
+  geom_histogram(bins = 100, position = "identity", alpha = .4) +
+  labs(x = "mean fold changes", 
+       title = paste0("Frequency Histograms of Mean Fold Changes")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom"),
+  ncol = 2
+)
+```
+
+```{r, fig.width=8}
+compare_hist_df4 <- data.frame(
+  studentized_fold_changes = tab$studentized_pTVG_HP,
+  JITC_signif = as.factor(tab$JITC_signif)
+)
+
+grid.arrange(
+  ggplot(compare_hist_df4, aes(x = studentized_fold_changes, fill = JITC_signif)) +
+  geom_histogram(aes(y=..density..), bins = 100, position = "identity", alpha = .4) +
+  labs(x = "studentized fold changes", 
+       title = paste0("Density Histograms of studentized Fold Changes")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom"),
+  ggplot(compare_hist_df4, aes(x = studentized_fold_changes, fill = JITC_signif)) +
+  geom_histogram(bins = 100, position = "identity", alpha = .4) +
+  labs(x = "studentized fold changes", 
+       title = paste0("Frequency Histograms of studentized Fold Changes")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom"),
+  ncol = 2
+)
+```
+
+
+\bibliography{randomized_trial} 
